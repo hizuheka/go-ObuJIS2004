@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,8 +17,8 @@ import (
 // ==========================================
 
 const (
-	MaxSnippets  = 10
-	ContextChars = 10
+	MaxSnippets        = 10
+	DefaultContextSize = 20 // デフォルトを20文字に変更
 )
 
 // SearchResult は1つの検索語に対する結果を保持します
@@ -31,6 +32,7 @@ type SearchResult struct {
 type Config struct {
 	InputFilePath string
 	Queries       []string
+	ContextSize   int // コンテキスト文字数を保持するフィールドを追加
 }
 
 // ==========================================
@@ -70,14 +72,17 @@ func ParseArgs(args []string, execPath string) (*Config, error) {
 		return nil, errors.New("no search queries found in executable name")
 	}
 
+	// ContextSizeはここではデフォルト値を入れるか、呼び出し元で上書きする設計とする
+	// ここでは構造体の初期化のみ行う
 	return &Config{
 		InputFilePath: inputFile,
 		Queries:       validQueries,
+		ContextSize:   DefaultContextSize,
 	}, nil
 }
 
-// SearchStream はストリームから文字列を検索します。
-func SearchStream(r io.Reader, queries []string) (map[string]*SearchResult, error) {
+// SearchStream はストリームから文字列を検索します。contextSizeを受け取るように変更
+func SearchStream(r io.Reader, queries []string, contextSize int) (map[string]*SearchResult, error) {
 	results := make(map[string]*SearchResult)
 	for _, q := range queries {
 		results[q] = &SearchResult{Query: q}
@@ -107,8 +112,8 @@ func SearchStream(r io.Reader, queries []string) (map[string]*SearchResult, erro
 				if lineRunes == nil {
 					lineRunes = []rune(lineText)
 				}
-
-				snippet := extractSnippet(lineRunes, q)
+				// contextSizeを渡す
+				snippet := extractSnippet(lineRunes, q, contextSize)
 				res.Snippets = append(res.Snippets, snippet)
 			}
 		}
@@ -121,8 +126,8 @@ func SearchStream(r io.Reader, queries []string) (map[string]*SearchResult, erro
 	return results, nil
 }
 
-// extractSnippet は行の中からクエリを見つけ、前後10文字を切り出します
-func extractSnippet(lineRunes []rune, query string) string {
+// extractSnippet は指定されたcontextSizeに基づいて文字を切り出します
+func extractSnippet(lineRunes []rune, query string, contextSize int) string {
 	queryRunes := []rune(query)
 	qLen := len(queryRunes)
 	lineLen := len(lineRunes)
@@ -147,12 +152,13 @@ func extractSnippet(lineRunes []rune, query string) string {
 		return "" // 事前のContainsチェックがあるため通常は到達しない
 	}
 
-	start := idx - ContextChars
+	// 定数ContextCharsではなく、引数contextSizeを使用
+	start := idx - contextSize
 	if start < 0 {
 		start = 0
 	}
 
-	end := idx + qLen + ContextChars
+	end := idx + qLen + contextSize
 	if end > lineLen {
 		end = lineLen
 	}
@@ -183,43 +189,78 @@ func WriteResults(w io.Writer, results map[string]*SearchResult, queryOrder []st
 // ==========================================
 
 type AppContext struct {
-	Args       []string
-	ExecPath   string
-	Stdout     io.Writer
-	Stderr     io.Writer
-	FileReader func(string) (io.ReadCloser, error)
+	Args        []string
+	ExecPath    string
+	Stdout      io.Writer
+	Stderr      io.Writer
+	FileReader  func(string) (io.ReadCloser, error)
+	FileCreator func(string) (io.WriteCloser, error)
 }
 
 func Run(ctx AppContext) int {
 	logger := slog.New(slog.NewTextHandler(ctx.Stderr, nil))
 
-	// 引数調整: os.Argsの先頭は通常実行パスだが、DIで渡される場合は注意が必要
-	userArgs := ctx.Args
-	if len(userArgs) > 0 {
-		// 一般的なCLIの振る舞いとして、最初の要素(プログラム名)をスキップして実引数を取得
-		userArgs = userArgs[1:]
+	args := make([]string, len(ctx.Args))
+	copy(args, ctx.Args)
+	if len(args) > 0 {
+		args = args[1:]
 	}
 
-	config, err := ParseArgs(userArgs, ctx.ExecPath)
+	fs := flag.NewFlagSet("app", flag.ContinueOnError)
+	outputFile := fs.String("o", "", "Output file path (optional)")
+	// コンテキストサイズを指定するフラグ -n を追加
+	contextSize := fs.Int("n", DefaultContextSize, "Number of context characters (default 20)")
+
+	if err := fs.Parse(args); err != nil {
+		logger.Error("Flag parse error", "error", err)
+		return 1
+	}
+
+	// 負の値が指定された場合のガード
+	if *contextSize < 0 {
+		logger.Error("Context size cannot be negative")
+		return 1
+	}
+
+	remainingArgs := fs.Args()
+	config, err := ParseArgs(remainingArgs, ctx.ExecPath)
 	if err != nil {
 		logger.Error("Configuration error", "error", err)
 		return 1
 	}
 
+	// フラグで指定された値をConfigに適用
+	config.ContextSize = *contextSize
+
+	var outWriter io.Writer
+
+	if *outputFile != "" {
+		f, err := ctx.FileCreator(*outputFile)
+		if err != nil {
+			logger.Error("Failed to create output file", "path", *outputFile, "error", err)
+			return 1
+		}
+		defer f.Close()
+		outWriter = io.MultiWriter(ctx.Stdout, f)
+	} else {
+		outWriter = ctx.Stdout
+	}
+
 	f, err := ctx.FileReader(config.InputFilePath)
 	if err != nil {
-		logger.Error("Failed to open file", "path", config.InputFilePath, "error", err)
+		logger.Error("Failed to open input file", "path", config.InputFilePath, "error", err)
 		return 1
 	}
 	defer f.Close()
 
-	results, err := SearchStream(f, config.Queries)
+	// 検索実行時にコンテキストサイズを渡す
+	results, err := SearchStream(f, config.Queries, config.ContextSize)
 	if err != nil {
 		logger.Error("Search failed", "error", err)
 		return 1
 	}
 
-	WriteResults(ctx.Stdout, results, config.Queries)
+	WriteResults(outWriter, results, config.Queries)
 
 	return 0
 }
@@ -237,6 +278,9 @@ func main() {
 		Stderr:   os.Stderr,
 		FileReader: func(path string) (io.ReadCloser, error) {
 			return os.Open(path)
+		},
+		FileCreator: func(path string) (io.WriteCloser, error) {
+			return os.Create(path)
 		},
 	}
 
